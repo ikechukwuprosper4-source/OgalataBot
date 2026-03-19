@@ -117,4 +117,4 @@ def get_live_fixtures(league_id: int = None):
     params = {"live": "all"}
     if league_id:
         params["league"] = league_id
-    return _get("fixtures", params, None, 0
+    return _get("fixtures", params, None, 0)
