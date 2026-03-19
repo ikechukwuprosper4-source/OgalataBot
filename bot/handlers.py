@@ -2,6 +2,7 @@
 # bot/handlers.py — All Telegram handlers
 # ============================================================
 import logging
+from datetime import date, datetime, timezone
 from telegram import Update
 from telegram.ext import (Application, CommandHandler, CallbackQueryHandler,
                            MessageHandler, filters, ContextTypes)
@@ -27,6 +28,42 @@ from bot.keyboards   import (main_menu_keyboard, league_keyboard,
 log = logging.getLogger(__name__)
 
 
+# ─── Shared helper: get today's fixtures across all leagues ──
+def _fetch_todays_fixtures() -> list:
+    """
+    Try every supported league for today's fixtures.
+    Returns list of (fixture, league_name, league_id) tuples.
+    """
+    results = []
+    for lg_name, lg_info in SUPPORTED_LEAGUES.items():
+        try:
+            fixtures = get_fixtures_today(lg_info["id"], lg_info["season"])
+            for f in fixtures:
+                results.append((f, lg_name, lg_info["id"]))
+        except Exception as e:
+            log.error(f"Error fetching today for {lg_name}: {e}")
+    return results
+
+
+def _fetch_upcoming_fixtures(limit: int = 10) -> list:
+    """
+    Fetch upcoming fixtures across all leagues as fallback.
+    Returns list of (fixture, league_name, league_id) tuples.
+    """
+    results = []
+    for lg_name, lg_info in SUPPORTED_LEAGUES.items():
+        try:
+            fixtures = get_fixtures_next(lg_info["id"],
+                                         lg_info["season"], next_n=5)
+            for f in fixtures[:3]:
+                results.append((f, lg_name, lg_info["id"]))
+        except Exception as e:
+            log.error(f"Error fetching upcoming for {lg_name}: {e}")
+        if len(results) >= limit:
+            break
+    return results
+
+
 # ─────────────────────────────────────────────────────────────
 # /start
 # ─────────────────────────────────────────────────────────────
@@ -36,8 +73,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (
         f"🤖 *ProSportsBot — AI Predictions*\n\n"
         f"Welcome, *{user.first_name}*! 👋\n\n"
-        f"I use Dixon-Coles Poisson models, live odds, form analysis "
-        f"and H2H stats to predict *every market*:\n\n"
+        f"I use Dixon-Coles Poisson models, live odds, "
+        f"xG data, injuries and lineups to predict "
+        f"*every betting market*:\n\n"
         f"• 1X2, Double Chance, DNB\n"
         f"• Over/Under 0.5 – 4.5\n"
         f"• Both Teams to Score\n"
@@ -94,15 +132,17 @@ async def cmd_predict(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    parts = args.lower().split(" vs ")
-    home  = parts[0].strip().title()
-    away  = parts[1].strip().title()
-
+    parts     = args.lower().split(" vs ")
+    home      = parts[0].strip().title()
+    away      = parts[1].strip().title()
     league_id = 39
+
     for name, info in SUPPORTED_LEAGUES.items():
         if name.lower() in away.lower():
             league_id = info["id"]
-            away = away.lower().replace(name.lower(), "").strip().title()
+            away = away.lower().replace(
+                name.lower(), ""
+            ).strip().title()
             break
 
     msg = await update.message.reply_text(
@@ -113,8 +153,9 @@ async def cmd_predict(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = format_prediction(pred)
     fid  = pred.get("fixture_id")
     kb   = fixture_action_keyboard(fid) if fid else back_keyboard()
-    await msg.edit_text(text, parse_mode=ParseMode.MARKDOWN,
-                        reply_markup=kb)
+    await msg.edit_text(
+        text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb
+    )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -130,7 +171,9 @@ async def cmd_fixture(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         fid = int(ctx.args[0])
     except ValueError:
-        await update.message.reply_text("Please provide a valid numeric fixture ID.")
+        await update.message.reply_text(
+            "Please provide a valid numeric fixture ID."
+        )
         return
 
     msg  = await update.message.reply_text("🔮 Loading prediction...")
@@ -139,29 +182,124 @@ async def cmd_fixture(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(f"❌ {pred['error']}")
         return
     text = format_prediction(pred)
-    await msg.edit_text(text, parse_mode=ParseMode.MARKDOWN,
-                        reply_markup=fixture_action_keyboard(fid))
+    await msg.edit_text(
+        text, parse_mode=ParseMode.MARKDOWN,
+        reply_markup=fixture_action_keyboard(fid)
+    )
 
 
 # ─────────────────────────────────────────────────────────────
-# /today
+# /today  — fully rewritten with fallback
 # ─────────────────────────────────────────────────────────────
 async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg   = await update.message.reply_text("📅 Fetching today's matches...")
-    lines = [f"📅 *Today's Predictions*\n{'─'*30}"]
-    count = 0
-    for lg_name, lg_info in list(SUPPORTED_LEAGUES.items())[:5]:
-        fixtures = get_fixtures_today(lg_info["id"], lg_info["season"])
-        for f in fixtures[:3]:
-            hn   = f.get("teams",{}).get("home",{}).get("name","?")
-            an   = f.get("teams",{}).get("away",{}).get("name","?")
-            pred = predict_by_names(hn, an, lg_info["id"])
-            lines.append(format_short_prediction(pred))
-            count += 1
-    if count == 0:
-        lines.append("No matches today in tracked leagues.")
-    await msg.edit_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN,
-                        reply_markup=back_keyboard())
+    today_str = str(date.today())
+    msg = await update.message.reply_text(
+        f"📅 Fetching matches for {today_str}..."
+    )
+
+    # ── Try today's fixtures ─────────────────────────────────
+    todays = _fetch_todays_fixtures()
+
+    if todays:
+        lines = [f"📅 *Today's Picks — {today_str}*\n{'─'*32}\n"]
+        for f, lg_name, lg_id in todays[:12]:
+            try:
+                hn  = f.get("teams",{}).get("home",{}).get("name","?")
+                an  = f.get("teams",{}).get("away",{}).get("name","?")
+                fid = f.get("fixture",{}).get("id","")
+                dt  = f.get("fixture",{}).get("date","")
+                # Format kick-off time
+                try:
+                    ko = datetime.fromisoformat(
+                        dt.replace("Z", "+00:00")
+                    ).strftime("%H:%M UTC")
+                except Exception:
+                    ko = dt[11:16]
+
+                pred = predict_by_names(hn, an, lg_id)
+                tip  = pred.get("tip", {})
+                conf = pred.get("confidence", 0)
+                lh   = pred.get("lambda_home", 0)
+                la   = pred.get("lambda_away", 0)
+                m    = pred.get("markets", {})
+                ou   = m.get("over_under", {}).get("2.5", {})
+
+                lines.append(
+                    f"⚽ *{hn} vs {an}*\n"
+                    f"🏆 {lg_name} | 🕐 {ko}\n"
+                    f"🎯 *{tip.get('market','')}* → "
+                    f"*{tip.get('selection','')}* "
+                    f"@ `{tip.get('fair_odds','?')}`\n"
+                    f"📊 Conf: {conf}%  "
+                    f"xG: {lh:.2f}–{la:.2f}\n"
+                    f"O2.5: {round(ou.get('over',0)*100,1)}%  "
+                    f"BTTS: {round(m.get('btts_yes',0)*100,1)}%\n"
+                    f"🔮 Full: /fixture\\_{fid}\n"
+                    f"{'─'*32}\n"
+                )
+            except Exception as e:
+                log.error(f"Error building today card: {e}")
+                continue
+
+        await msg.edit_text(
+            "\n".join(lines),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=back_keyboard()
+        )
+
+    else:
+        # ── No matches today → show upcoming ────────────────
+        upcoming = _fetch_upcoming_fixtures(limit=12)
+
+        if upcoming:
+            lines = [
+                f"📅 *No matches today ({today_str})*\n"
+                f"📆 *Next Upcoming Fixtures*\n{'─'*32}\n"
+            ]
+            for f, lg_name, lg_id in upcoming[:12]:
+                try:
+                    hn  = f.get("teams",{}).get("home",{}).get("name","?")
+                    an  = f.get("teams",{}).get("away",{}).get("name","?")
+                    fid = f.get("fixture",{}).get("id","")
+                    dt  = f.get("fixture",{}).get("date","")[:10]
+
+                    pred = predict_by_names(hn, an, lg_id)
+                    tip  = pred.get("tip", {})
+                    conf = pred.get("confidence", 0)
+                    lh   = pred.get("lambda_home", 0)
+                    la   = pred.get("lambda_away", 0)
+
+                    lines.append(
+                        f"📅 {dt} | {lg_name}\n"
+                        f"⚽ *{hn} vs {an}*\n"
+                        f"🎯 *{tip.get('market','')}* → "
+                        f"*{tip.get('selection','')}* "
+                        f"@ `{tip.get('fair_odds','?')}`\n"
+                        f"📊 Conf: {conf}%  "
+                        f"xG: {lh:.2f}–{la:.2f}\n"
+                        f"🔮 Full: /fixture\\_{fid}\n"
+                        f"{'─'*32}\n"
+                    )
+                except Exception as e:
+                    log.error(f"Error building upcoming card: {e}")
+                    continue
+
+            await msg.edit_text(
+                "\n".join(lines),
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=back_keyboard()
+            )
+        else:
+            await msg.edit_text(
+                f"⚠️ *No fixtures found for {today_str}*\n\n"
+                f"Possible reasons:\n"
+                f"• API-Football free plan limit reached (100 req/day)\n"
+                f"• No matches scheduled in tracked leagues today\n"
+                f"• Try `/upcoming` to browse by league\n"
+                f"• Try `/predict Arsenal vs Chelsea` directly",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=back_keyboard()
+            )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -182,20 +320,24 @@ async def cmd_live(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg  = await update.message.reply_text("📡 Fetching live scores...")
     live = get_live_fixtures()
     if not live:
-        await msg.edit_text("No live matches right now.",
-                            reply_markup=back_keyboard())
+        await msg.edit_text(
+            "No live matches right now.\nTry /today for today's fixtures.",
+            reply_markup=back_keyboard()
+        )
         return
     lines = ["📡 *Live Scores*\n"]
     for f in live[:15]:
         hn   = f.get("teams",{}).get("home",{}).get("name","?")
         an   = f.get("teams",{}).get("away",{}).get("name","?")
-        gh   = f.get("goals",{}).get("home","?")
-        ga   = f.get("goals",{}).get("away","?")
+        gh   = f.get("goals",{}).get("home","0")
+        ga   = f.get("goals",{}).get("away","0")
         min_ = f.get("fixture",{}).get("status",{}).get("elapsed","?")
         lg   = f.get("league",{}).get("name","?")
         lines.append(f"⚽ {hn} *{gh}–{ga}* {an} | {min_}' | {lg}")
-    await msg.edit_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN,
-                        reply_markup=back_keyboard())
+    await msg.edit_text(
+        "\n".join(lines), parse_mode=ParseMode.MARKDOWN,
+        reply_markup=back_keyboard()
+    )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -205,20 +347,25 @@ async def cmd_odds(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg  = await update.message.reply_text("🔍 Fetching live odds...")
     data = get_odds("soccer_epl", markets="h2h,totals,spreads")
     if not data:
-        await msg.edit_text("No odds data available right now.",
-                            reply_markup=back_keyboard())
+        await msg.edit_text(
+            "No odds data available right now.",
+            reply_markup=back_keyboard()
+        )
         return
     lines = ["💰 *Live Odds — Premier League*\n"]
     for event in (data[:5] if isinstance(data, list) else []):
         home = event.get("home_team", "?")
         away = event.get("away_team", "?")
+        dt   = event.get("commence_time","")[:10]
         best = extract_best_odds([event], "h2h")
-        lines.append(f"⚽ *{home} vs {away}*")
+        lines.append(f"⚽ *{home} vs {away}* | {dt}")
         for outcome, (odds, bookie) in best.items():
             lines.append(f"  {outcome}: `{odds}` ({bookie})")
         lines.append("")
-    await msg.edit_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN,
-                        reply_markup=back_keyboard())
+    await msg.edit_text(
+        "\n".join(lines), parse_mode=ParseMode.MARKDOWN,
+        reply_markup=back_keyboard()
+    )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -234,19 +381,25 @@ async def cmd_h2h(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     mid = len(ctx.args) // 2
     t1  = " ".join(ctx.args[:mid])
     t2  = " ".join(ctx.args[mid:])
-    msg = await update.message.reply_text(f"🔄 Loading H2H: {t1} vs {t2}...")
+    msg = await update.message.reply_text(
+        f"🔄 Loading H2H: {t1} vs {t2}..."
+    )
 
     t1_data = search_team(t1)
     t2_data = search_team(t2)
     if not t1_data or not t2_data:
-        await msg.edit_text("Could not find one or both teams.")
+        await msg.edit_text(
+            "Could not find one or both teams. Try full team names."
+        )
         return
 
     id1 = t1_data[0]["team"]["id"]
     id2 = t2_data[0]["team"]["id"]
     h2h = get_head_to_head(id1, id2, last=10)
     if not h2h:
-        await msg.edit_text(f"No H2H data found for {t1} vs {t2}.")
+        await msg.edit_text(
+            f"No H2H data found for {t1} vs {t2}."
+        )
         return
 
     lines = [f"🔄 *H2H: {t1.title()} vs {t2.title()}*\n"]
@@ -254,22 +407,27 @@ async def cmd_h2h(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     for m in h2h:
         hn  = m.get("teams",{}).get("home",{}).get("name","?")
         an  = m.get("teams",{}).get("away",{}).get("name","?")
-        gh  = m.get("goals",{}).get("home",0) or 0
-        ga  = m.get("goals",{}).get("away",0) or 0
+        gh  = m.get("goals",{}).get("home", 0) or 0
+        ga  = m.get("goals",{}).get("away", 0) or 0
         dt  = m.get("fixture",{}).get("date","")[:10]
         won = (hn.lower()==t1.lower() and gh>ga) or \
               (an.lower()==t1.lower() and ga>gh)
         drew = gh == ga
         icon = "✅" if won else "🤝" if drew else "❌"
         lines.append(f"{icon} {dt} {hn} {gh}–{ga} {an}")
-        if hn.lower() in t1.lower(): hw += (1 if gh > ga else 0)
-        else:                         aw += (1 if gh > ga else 0)
-        if gh == ga: d += 1
+        if hn.lower() in t1.lower():
+            hw += (1 if gh > ga else 0)
+        else:
+            aw += (1 if gh > ga else 0)
+        if gh == ga:
+            d += 1
     lines.append(
         f"\n{t1.title()} W: {hw} | D: {d} | {t2.title()} W: {aw}"
     )
-    await msg.edit_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN,
-                        reply_markup=back_keyboard())
+    await msg.edit_text(
+        "\n".join(lines), parse_mode=ParseMode.MARKDOWN,
+        reply_markup=back_keyboard()
+    )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -279,10 +437,13 @@ async def cmd_form(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     name = " ".join(ctx.args)
     if not name:
         await update.message.reply_text(
-            "Usage: `/form Arsenal`", parse_mode=ParseMode.MARKDOWN
+            "Usage: `/form Arsenal`",
+            parse_mode=ParseMode.MARKDOWN
         )
         return
-    msg   = await update.message.reply_text(f"📋 Loading form for {name}...")
+    msg   = await update.message.reply_text(
+        f"📋 Loading form for {name}..."
+    )
     teams = search_team(name)
     if not teams:
         await msg.edit_text(f"Team '{name}' not found.")
@@ -297,8 +458,8 @@ async def cmd_form(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     for m in matches:
         hn      = m.get("teams",{}).get("home",{}).get("name","?")
         an      = m.get("teams",{}).get("away",{}).get("name","?")
-        gh      = m.get("goals",{}).get("home",0) or 0
-        ga      = m.get("goals",{}).get("away",0) or 0
+        gh      = m.get("goals",{}).get("home", 0) or 0
+        ga      = m.get("goals",{}).get("away", 0) or 0
         dt      = m.get("fixture",{}).get("date","")[:10]
         lg      = m.get("league",{}).get("name","")
         is_home = m.get("teams",{}).get("home",{}).get("id") == team_id
@@ -306,8 +467,11 @@ async def cmd_form(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         drew    = gh == ga
         icon    = "✅" if won else "🤝" if drew else "❌"
         lines.append(f"{icon} {dt} {hn} {gh}–{ga} {an} ({lg})")
-    await msg.edit_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN,
-                        reply_markup=back_keyboard())
+
+    await msg.edit_text(
+        "\n".join(lines), parse_mode=ParseMode.MARKDOWN,
+        reply_markup=back_keyboard()
+    )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -315,7 +479,9 @@ async def cmd_form(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────────────────────
 async def cmd_standings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     code = ctx.args[0].upper() if ctx.args else "PL"
-    msg  = await update.message.reply_text(f"🏆 Loading standings for {code}...")
+    msg  = await update.message.reply_text(
+        f"🏆 Loading standings for {code}..."
+    )
     data = get_standings(code)
     if not data or not data.get("standings"):
         await msg.edit_text(
@@ -324,42 +490,68 @@ async def cmd_standings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
     text = format_standings(data)
-    await msg.edit_text(text, parse_mode=ParseMode.MARKDOWN,
-                        reply_markup=back_keyboard())
+    await msg.edit_text(
+        text, parse_mode=ParseMode.MARKDOWN,
+        reply_markup=back_keyboard()
+    )
 
 
 # ─────────────────────────────────────────────────────────────
 # /valuebets
 # ─────────────────────────────────────────────────────────────
 async def cmd_valuebets(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg     = await update.message.reply_text("💎 Scanning for value bets...")
+    msg     = await update.message.reply_text(
+        "💎 Scanning for value bets..."
+    )
     all_vbs = []
-    for lg_name, lg_info in list(SUPPORTED_LEAGUES.items())[:3]:
-        fixtures = get_fixtures_next(lg_info["id"], lg_info["season"], next_n=5)
-        for f in fixtures[:3]:
-            hn   = f.get("teams",{}).get("home",{}).get("name","?")
-            an   = f.get("teams",{}).get("away",{}).get("name","?")
-            pred = predict_by_names(hn, an, lg_info["id"])
-            for vb in pred.get("value_bets", []):
-                vb["home"] = hn
-                vb["away"] = an
-                all_vbs.append(vb)
+
+    for lg_name, lg_info in list(SUPPORTED_LEAGUES.items())[:4]:
+        try:
+            fixtures = get_fixtures_next(
+                lg_info["id"], lg_info["season"], next_n=5
+            )
+            for f in fixtures[:3]:
+                hn   = f.get("teams",{}).get("home",{}).get("name","?")
+                an   = f.get("teams",{}).get("away",{}).get("name","?")
+                dt   = f.get("fixture",{}).get("date","")[:10]
+                pred = predict_by_names(hn, an, lg_info["id"])
+                for vb in pred.get("value_bets", []):
+                    vb["home"]   = hn
+                    vb["away"]   = an
+                    vb["date"]   = dt
+                    vb["league"] = lg_name
+                    all_vbs.append(vb)
+        except Exception as e:
+            log.error(f"Value bet scan error for {lg_name}: {e}")
+
     all_vbs.sort(key=lambda x: x.get("edge_pct", 0), reverse=True)
+
     if not all_vbs:
         await msg.edit_text(
-            "💎 No strong value bets at current odds.\n"
-            "Check back closer to kick-off.",
+            "💎 *No value bets found right now*\n\n"
+            "This means bookmaker odds are fairly priced at the moment.\n"
+            "Check back closer to kick-off when odds sharpen.\n\n"
+            "You can also try `/predict Team A vs Team B` to check "
+            "a specific match manually.",
+            parse_mode=ParseMode.MARKDOWN,
             reply_markup=back_keyboard()
         )
         return
-    lines = ["💎 *Top Value Bets*\n"]
+
+    lines = [f"💎 *Top Value Bets — {str(date.today())}*\n{'─'*32}\n"]
     for vb in all_vbs[:8]:
         lines.append(
-            format_value_alert(vb, vb.get("home","?"), vb.get("away","?"))
+            f"📅 {vb.get('date','')} | {vb.get('league','')}\n"
+            + format_value_alert(
+                vb, vb.get("home","?"), vb.get("away","?")
+            )
+            + f"{'─'*32}\n"
         )
-        lines.append("─" * 20)
-    await msg.edit_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN,
-                        reply_markup=back_keyboard())
+
+    await msg.edit_text(
+        "\n".join(lines), parse_mode=ParseMode.MARKDOWN,
+        reply_markup=back_keyboard()
+    )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -377,22 +569,28 @@ async def cmd_bankroll(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             update_bankroll(user.id, amount)
             await update.message.reply_text(
                 f"💰 Bankroll updated to *{amount:.2f}*\n"
-                f"Max bet (5%): {amount*0.05:.2f}",
+                f"Max bet (5%): {amount * 0.05:.2f}\n"
+                f"Med bet (3%): {amount * 0.03:.2f}\n"
+                f"Min bet (1%): {amount * 0.01:.2f}",
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=bankroll_keyboard()
             )
         except ValueError:
             await update.message.reply_text(
-                "Usage: `/bankroll 1000`", parse_mode=ParseMode.MARKDOWN
+                "Usage: `/bankroll 1000`",
+                parse_mode=ParseMode.MARKDOWN
             )
     else:
         text = (
             f"💰 *Bankroll Management*\n\n"
             f"Current bankroll: *{current:.2f}*\n\n"
             f"📐 *Recommended stakes*\n"
-            f"High confidence 80%+: up to {current*0.05:.2f} (5%)\n"
-            f"Medium confidence 65%+: {current*0.03:.2f} (3%)\n"
-            f"Low confidence <65%: {current*0.01:.2f} (1%)\n\n"
+            f"High confidence 80%+: "
+            f"up to {current * 0.05:.2f} (5%)\n"
+            f"Medium confidence 65%+: "
+            f"{current * 0.03:.2f} (3%)\n"
+            f"Low confidence below 65%: "
+            f"{current * 0.01:.2f} (1%)\n\n"
             f"Set new bankroll: `/bankroll 1500`"
         )
         await update.message.reply_text(
@@ -423,17 +621,20 @@ async def cmd_bet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     upsert_user(user.id, user.username or "")
     if len(ctx.args) < 5:
         await update.message.reply_text(
-            "Usage: `/bet <fixture_id> <market> <selection> <odds> <stake>`\n"
+            "Usage: `/bet <fixture_id> <market> <selection> "
+            "<odds> <stake>`\n"
             "Example: `/bet 1234567 1X2 HomeWin 1.95 50`",
             parse_mode=ParseMode.MARKDOWN
         )
         return
     try:
-        fid, market, sel = ctx.args[0], ctx.args[1], ctx.args[2]
-        odds  = float(ctx.args[3])
-        stake = float(ctx.args[4])
-        row   = get_user(user.id)
-        broll = row["bankroll"] if row else 1000.0
+        fid    = ctx.args[0]
+        market = ctx.args[1]
+        sel    = ctx.args[2]
+        odds   = float(ctx.args[3])
+        stake  = float(ctx.args[4])
+        row    = get_user(user.id)
+        broll  = row["bankroll"] if row else 1000.0
         log_bet(user.id, fid, market, sel, odds, stake, broll)
         potential = stake * (odds - 1)
         await update.message.reply_text(
@@ -501,6 +702,7 @@ async def callback_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data = q.data
     await q.answer()
 
+    # ── Main menu ────────────────────────────────────────────
     if data == "main_menu":
         await q.edit_message_text(
             "🤖 *ProSportsBot — Main Menu*\nChoose an option:",
@@ -508,6 +710,7 @@ async def callback_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=main_menu_keyboard()
         )
 
+    # ── Leagues ──────────────────────────────────────────────
     elif data == "leagues":
         await q.edit_message_text(
             "🏆 *Select a League*",
@@ -519,8 +722,10 @@ async def callback_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parts   = data.split("_", 2)
         lg_id   = int(parts[1])
         lg_name = parts[2] if len(parts) > 2 else "League"
-        season  = next((v["season"] for v in SUPPORTED_LEAGUES.values()
-                        if v["id"] == lg_id), 2024)
+        season  = next(
+            (v["season"] for v in SUPPORTED_LEAGUES.values()
+             if v["id"] == lg_id), 2025
+        )
         fixtures = get_fixtures_next(lg_id, season, next_n=10)
         text     = format_fixtures_list(fixtures, lg_name)
         await q.edit_message_text(
@@ -528,22 +733,81 @@ async def callback_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=back_keyboard("leagues")
         )
 
+    # ── Today ────────────────────────────────────────────────
     elif data == "today":
-        lines = ["📅 *Today's Predictions*\n"]
-        for lg_name, lg_info in list(SUPPORTED_LEAGUES.items())[:4]:
-            fixtures = get_fixtures_today(lg_info["id"], lg_info["season"])
-            for f in fixtures[:2]:
-                hn   = f.get("teams",{}).get("home",{}).get("name","?")
-                an   = f.get("teams",{}).get("away",{}).get("name","?")
-                pred = predict_by_names(hn, an, lg_info["id"])
-                lines.append(format_short_prediction(pred))
-        if len(lines) == 1:
-            lines.append("No matches today.")
+        today_str = str(date.today())
+        todays    = _fetch_todays_fixtures()
+        lines     = []
+
+        if todays:
+            lines = [
+                f"📅 *Today's Picks — {today_str}*\n{'─'*32}\n"
+            ]
+            for f, lg_name, lg_id in todays[:8]:
+                try:
+                    hn  = f.get("teams",{}).get("home",{}).get("name","?")
+                    an  = f.get("teams",{}).get("away",{}).get("name","?")
+                    fid = f.get("fixture",{}).get("id","")
+                    dt  = f.get("fixture",{}).get("date","")
+                    try:
+                        ko = datetime.fromisoformat(
+                            dt.replace("Z","+00:00")
+                        ).strftime("%H:%M UTC")
+                    except Exception:
+                        ko = dt[11:16]
+                    pred = predict_by_names(hn, an, lg_id)
+                    tip  = pred.get("tip", {})
+                    conf = pred.get("confidence", 0)
+                    lh   = pred.get("lambda_home", 0)
+                    la   = pred.get("lambda_away", 0)
+                    lines.append(
+                        f"⚽ *{hn} vs {an}*\n"
+                        f"🏆 {lg_name} | 🕐 {ko}\n"
+                        f"🎯 *{tip.get('market','')}* → "
+                        f"*{tip.get('selection','')}*\n"
+                        f"📊 Conf: {conf}%  "
+                        f"xG: {lh:.2f}–{la:.2f}\n"
+                        f"🔮 /fixture\\_{fid}\n"
+                        f"{'─'*32}\n"
+                    )
+                except Exception:
+                    continue
+        else:
+            upcoming = _fetch_upcoming_fixtures(limit=8)
+            lines = [
+                f"📅 *No matches today — Next Upcoming*\n{'─'*32}\n"
+            ]
+            for f, lg_name, lg_id in upcoming:
+                try:
+                    hn  = f.get("teams",{}).get("home",{}).get("name","?")
+                    an  = f.get("teams",{}).get("away",{}).get("name","?")
+                    fid = f.get("fixture",{}).get("id","")
+                    dt  = f.get("fixture",{}).get("date","")[:10]
+                    pred = predict_by_names(hn, an, lg_id)
+                    tip  = pred.get("tip", {})
+                    conf = pred.get("confidence", 0)
+                    lines.append(
+                        f"📅 {dt} | {lg_name}\n"
+                        f"⚽ *{hn} vs {an}*\n"
+                        f"🎯 *{tip.get('market','')}* → "
+                        f"*{tip.get('selection','')}*\n"
+                        f"📊 Conf: {conf}%\n"
+                        f"🔮 /fixture\\_{fid}\n"
+                        f"{'─'*32}\n"
+                    )
+                except Exception:
+                    continue
+
+        if not lines:
+            lines = ["⚠️ No fixtures found. Try /predict directly."]
+
         await q.edit_message_text(
-            "\n".join(lines), parse_mode=ParseMode.MARKDOWN,
+            "\n".join(lines),
+            parse_mode=ParseMode.MARKDOWN,
             reply_markup=back_keyboard()
         )
 
+    # ── Upcoming ─────────────────────────────────────────────
     elif data == "upcoming":
         await q.edit_message_text(
             "🏆 *Select a League*",
@@ -551,6 +815,7 @@ async def callback_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=league_keyboard()
         )
 
+    # ── Live ─────────────────────────────────────────────────
     elif data == "live":
         live = get_live_fixtures()
         if not live:
@@ -563,8 +828,8 @@ async def callback_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         for f in live[:10]:
             hn   = f.get("teams",{}).get("home",{}).get("name","?")
             an   = f.get("teams",{}).get("away",{}).get("name","?")
-            gh   = f.get("goals",{}).get("home","?")
-            ga   = f.get("goals",{}).get("away","?")
+            gh   = f.get("goals",{}).get("home","0")
+            ga   = f.get("goals",{}).get("away","0")
             min_ = f.get("fixture",{}).get("status",{}).get("elapsed","?")
             lines.append(f"⚽ {hn} *{gh}–{ga}* {an} | {min_}'")
         await q.edit_message_text(
@@ -572,6 +837,7 @@ async def callback_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=back_keyboard()
         )
 
+    # ── Predict ──────────────────────────────────────────────
     elif data.startswith("predict_"):
         fid  = int(data.split("_")[1])
         await q.edit_message_text(
@@ -585,14 +851,16 @@ async def callback_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=prediction_detail_keyboard(fid)
         )
 
+    # ── Value bets ───────────────────────────────────────────
     elif data == "valuebets":
         await q.edit_message_text(
             "💎 Use /valuebets for the full scan.\n"
-            "Updated every 30 minutes.",
+            "Updated every 2 hours.",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=back_keyboard()
         )
 
+    # ── My stats ─────────────────────────────────────────────
     elif data == "mystats":
         uid   = q.from_user.id
         stats = get_user_stats(uid)
@@ -602,6 +870,7 @@ async def callback_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=back_keyboard()
         )
 
+    # ── Bankroll ─────────────────────────────────────────────
     elif data == "bankroll":
         uid   = q.from_user.id
         row   = get_user(uid)
@@ -613,12 +882,14 @@ async def callback_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=bankroll_keyboard()
         )
 
+    # ── Help ─────────────────────────────────────────────────
     elif data == "help":
         await q.edit_message_text(
             "Type /help for the full command list.",
             reply_markup=back_keyboard()
         )
 
+    # ── Cancel ───────────────────────────────────────────────
     elif data == "cancel":
         await q.edit_message_text(
             "Cancelled.", reply_markup=back_keyboard()
@@ -635,7 +906,8 @@ async def unknown_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await cmd_predict(update, ctx)
     else:
         await update.message.reply_text(
-            "Type `Team A vs Team B` to predict, or /help for commands.",
+            "Type `Team A vs Team B` to predict, "
+            "or /help for all commands.",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=main_menu_keyboard()
         )
