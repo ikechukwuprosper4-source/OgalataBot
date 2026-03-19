@@ -1,0 +1,2 @@
+# OgalataBot
+Sports trading bots
